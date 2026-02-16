@@ -55,13 +55,6 @@ except ImportError:
     count_string_tokens = None
 
 
-from tokencost import (
-    calculate_completion_cost,
-    calculate_prompt_cost,
-    count_message_tokens,
-    count_string_tokens,
-)
-
 from .solution import Solution
 from .utils import NoCodeException
 
@@ -261,15 +254,18 @@ class LLM(ABC):
         Returns:
             ConfigSpace: Extracted configuration space object.
         """
-        if ConfigurationSpace == None:
-            raise Exception("Please install the ConfigSpace package first.")
+        try:
+            from ConfigSpace import ConfigurationSpace
+        except ImportError:
+            # ConfigSpace not installed, no HPO
+            return None
+
         pattern = r"space\s*:\s*\n*```\n*(?:python)?\n(.*?)\n```"
         c = None
         for m in re.finditer(pattern, message, re.DOTALL | re.IGNORECASE):
             try:
-                from ConfigSpace import ConfigurationSpace
-
-                c = ConfigurationSpace(eval(m.group(1)))
+                cfg_dict = eval(m.group(1), {"__builtins__": {}})
+                c = ConfigurationSpace(cfg_dict)
             except Exception:
                 pass
         return c
