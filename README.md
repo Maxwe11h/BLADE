@@ -8,6 +8,8 @@
 
 <h1 align="center">IOH-BLADE: Benchmarking LLM-driven Automated Design and Evolution of Iterative Optimization Heuristics</h1>
 
+> ⭐ If you like this, please give the repo a star – it helps!
+
 <p align="center">
   <a href="https://pypi.org/project/iohblade/">
     <img src="https://badge.fury.io/py/iohblade.svg" alt="PyPI version" height="18">
