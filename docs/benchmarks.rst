@@ -12,9 +12,9 @@ These instances are available in two complementary forms:
 
 The packaged benchmarks are grouped by domain.
 
-.. _list_of_benchmarks:
 ------------------------------------------------------------------------------------
 
+.. _list_of_benchmarks:
 List of Benchmarks
 ------------------
 
