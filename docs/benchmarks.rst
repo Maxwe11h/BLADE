@@ -80,12 +80,14 @@ AutoML
 
 -----------
 
-Black Box Optimisation Benchmarking (BBOB)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Black Box and Photonics Optimisation (BBO & Photonics)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-- Contains a set of Black Box Optimisation problems and Multi-Affine Black Box Optimisation Problems from the ``ioh`` library.
-- Includes a special benchmark ``SBOX-COST``, which is similar to BBOB but defined on the domain :math:`[-5, 5]^n`.
+- Contains a set of Black Box Optimisation problems from the `ioh benchmarks`_ library.
 
+.. _ioh benchmarks: https://iohprofiler.github.io/IOHexp/
+
+- Also contains a set of **photonics** problems, supported by black bock optimisation.
 -----------
 
 Combinatorics
@@ -117,7 +119,7 @@ Euclidean Steiner Tree Problem
 - This benchmark takes a set of points, runs MST on the original points and on the points combined with Steiner points, and returns their ratio.
 - Optimisation goal:
 
-  :math:`\text{minimize} \ \frac{\text{mst(points + steiner\_points)}}{\text{mst(points)}}`
+  :math:`\min \frac{\text{mst(points + steiner_points)}}{\text{mst(points)}}`
 
 Graph Colouring Problem
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -462,18 +464,3 @@ Unit Square Packing
             \quad \forall i
 
 -----------
-
-Photonics
-^^^^^^^^^
-
-- Develop an optimization algorithm for photonics, evaluated as a black-box function.
-
-- Task:
-    - The algorithm should optimise a black-box function `func` using a fixed **budget** of function evaluations.
-    - The **problem dimensionality** is provided as `dim`, and the algorithm must handle arbitrary dimensions.
-    - Only **up to the allotted budget** of function evaluations may be used.
-
-- Evaluation:
-    - Performance is measured based on the quality of the solution found after consuming the full budget.
-    - Robustness, efficiency, and solution quality are all considered in scoring.
----------------------------------------------------------------------------------------------------------------
