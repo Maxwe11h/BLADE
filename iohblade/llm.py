@@ -625,7 +625,12 @@ class Ollama_LLM(LLM):
                     messages=[{"role": "user", "content": big_message}],
                     options=kwargs,
                 )
-                return response["message"]["content"]
+                content = response["message"]["content"]
+                # Strip thinking tags (e.g. Qwen3 thinking mode)
+                content = re.sub(
+                    r"<think>.*?</think>", "", content, flags=re.DOTALL
+                )
+                return content
 
             except ollama.ResponseError as err:
                 attempt += 1
