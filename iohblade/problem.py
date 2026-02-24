@@ -1,8 +1,11 @@
 import inspect
 import json
+import logging
 import multiprocessing
 import os
+import select
 import shutil
+import struct
 import subprocess
 import tempfile
 import traceback
@@ -12,6 +15,8 @@ from pathlib import Path
 
 import cloudpickle
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Standard packages installed in every evaluation environment
 BASE_DEPENDENCIES = [
@@ -62,7 +67,81 @@ def simplify_subprocess_error(stderr: str, solution=None):
     return msg
 
 
-"""Evaluate a solution in a dedicated virtual environment."""
+_WORKER_LOOP_SCRIPT = r'''
+import sys, os, struct, io, types
+
+# Keep real stdout/stderr for the binary protocol
+_real_stdout = sys.stdout.buffer
+_real_stderr = sys.stderr
+
+# Redirect stdout/stderr so print() in eval'd code can't corrupt our protocol
+sys.stdout = io.StringIO()
+sys.stderr = io.StringIO()
+
+# Register llamea.solution as alias for iohblade.solution so cloudpickle
+# can deserialise llamea.Solution without pulling in lizard/networkx/etc.
+import iohblade.solution as _blade_sol
+if 'llamea' not in sys.modules:
+    _pkg = types.ModuleType('llamea')
+    _pkg.__path__ = []
+    sys.modules['llamea'] = _pkg
+if 'llamea.solution' not in sys.modules:
+    sys.modules['llamea.solution'] = _blade_sol
+
+import cloudpickle
+
+problem_path = sys.argv[1]
+with open(problem_path, 'rb') as f:
+    problem = cloudpickle.load(f)
+
+def recv_msg(stream):
+    header = stream.read(4)
+    if not header or len(header) < 4:
+        return None
+    length = struct.unpack('>I', header)[0]
+    if length == 0:
+        return None
+    return stream.read(length)
+
+def send_msg(stream, data):
+    stream.write(struct.pack('>I', len(data)))
+    stream.write(data)
+    stream.flush()
+
+stdin = sys.stdin.buffer
+while True:
+    raw = recv_msg(stdin)
+    if raw is None:
+        break
+    try:
+        solution = cloudpickle.loads(raw)
+        result = problem.evaluate(solution)
+        captured_stdout = sys.stdout.getvalue()
+        captured_stderr = sys.stderr.getvalue()
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        response = cloudpickle.dumps({
+            'result': result,
+            'stdout': captured_stdout,
+            'stderr': captured_stderr,
+        })
+    except Exception as e:
+        captured_stdout = sys.stdout.getvalue()
+        captured_stderr = sys.stderr.getvalue()
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+        response = cloudpickle.dumps({
+            'error': str(e),
+            'stdout': captured_stdout,
+            'stderr': captured_stderr,
+        })
+    send_msg(_real_stdout, response)
+'''
+
+
+def _is_solution(data):
+    """Check if data is a Solution (supports both iohblade and llamea Solution)."""
+    return isinstance(data, Solution) or hasattr(data, 'set_scores')
 
 
 def evaluate_in_subprocess(problem, conn, solution):
@@ -103,7 +182,11 @@ def evaluate_in_subprocess(problem, conn, solution):
 
         env = os.environ.copy()
         repo_root = Path(__file__).resolve().parents[1]
-        env["PYTHONPATH"] = f"{repo_root}{os.pathsep}" + env.get("PYTHONPATH", "")
+        path_parts = [str(repo_root)]
+        for p in getattr(problem, 'extra_pythonpath', None) or []:
+            if p not in path_parts:
+                path_parts.insert(0, str(p))
+        env["PYTHONPATH"] = os.pathsep.join(path_parts) + os.pathsep + env.get("PYTHONPATH", "")
 
         proc = subprocess.Popen(
             [str(python_bin), str(script_path)],
@@ -176,6 +259,9 @@ class Problem(ABC):
         eval_timeout=6000,
         dependencies=None,
         imports=None,
+        use_worker_pool=False,
+        worker_recycle_interval=50,
+        extra_pythonpath=None,
     ):
         """
         Initializes a problem instance with logging and dataset references.
@@ -189,6 +275,9 @@ class Problem(ABC):
             budget (int): number of algorithms are allowed to be generated per run.
             dependencies (list, optional): a list of pypi packages to install before evaluation.
             imports (string, optional): the python string to manage imports in the evaluation file.
+            use_worker_pool (bool): If True, use a persistent worker process instead of spawning a new subprocess per evaluation.
+            worker_recycle_interval (int): Recycle the worker process every N evaluations.
+            extra_pythonpath (list, optional): Additional paths to prepend to PYTHONPATH in subprocesses.
         """
         self.logger = logger
         self.logger_dir = ""
@@ -212,6 +301,13 @@ class Problem(ABC):
         self._env_path: Path | None = None
         self._python_bin: Path | None = None
 
+        # Worker pool settings
+        self.use_worker_pool = use_worker_pool
+        self.worker_recycle_interval = worker_recycle_interval
+        self.extra_pythonpath = extra_pythonpath or []
+        self._worker_process = None
+        self._eval_count = 0
+
         # These settings are required for EoH, adapt them based on your problem.
         # The function name, inputs, and outputs should match the expected format.
         # For example, if your problem requires a function that takes a function, budget, and dimension,
@@ -225,28 +321,58 @@ class Problem(ABC):
         """
         Evaluates a solution on training instances and updates its fitness and feedback.
 
-        Args:
-            solution (Solution): Solution object to be evaluated.
-            logger (RunLogger, optional): The RunLogger object attached to the problem to keep track of evaluations.
-
-        Returns:
-            Solution: The evaluated solution with updated fitness and scores.
+        Routes to worker pool or subprocess-per-eval based on self.use_worker_pool.
         """
-        if logger != None:
-            print("LOGGER is NOT NONE (UNEXPECTED)")
+        if logger is not None:
             self.logger = logger
 
-        if self.logger != None:
+        if self.logger is not None:
             if self.logger.budget_exhausted():
                 solution.set_scores(
                     -np.inf,
                     feedback="Budget is exhausted.",
-                    error="Budget is exhausted.",
                 )
-                return solution  # Return early if budget is exhausted
+                return solution
 
-        # solution = self.evaluate(solution) #old fashioned way
-        # Else create a new process for evaluation with timeout
+        if self.use_worker_pool:
+            solution = self._call_worker_pool(solution)
+        else:
+            solution = self._call_subprocess(solution)
+
+        if self.logger is not None:
+            self.logger.log_individual(solution)
+        return solution
+
+    def _handle_result(self, result, solution):
+        """Process a result dict/object from either subprocess or worker pool."""
+        stdout = ""
+        stderr = ""
+        if isinstance(result, dict):
+            stdout = result.get("stdout", "")
+            stderr = result.get("stderr", "")
+            if "error" in result:
+                err = result["error"]
+                solution.set_scores(-np.inf, feedback=err)
+            else:
+                data = result.get("result")
+                if _is_solution(data):
+                    solution = data
+                elif isinstance(data, str):
+                    solution.set_scores(-np.inf, feedback=data)
+                else:
+                    raise Exception("No Solution object or string returned.")
+        elif isinstance(result, Exception):
+            raise result
+        elif _is_solution(result):
+            solution = result
+        elif isinstance(result, str):
+            solution.set_scores(-np.inf, feedback=result)
+        else:
+            raise Exception("No Solution object or string returned.")
+        return solution, stdout, stderr
+
+    def _call_subprocess(self, solution):
+        """Original subprocess-per-eval implementation."""
         stdout = ""
         stderr = ""
         self._last_stdout = ""
@@ -256,17 +382,12 @@ class Problem(ABC):
         child_conn = None
         try:
             self._ensure_env()
-            (
-                parent_conn,
-                child_conn,
-            ) = multiprocessing.Pipe()  # Create pipe for communication
+            parent_conn, child_conn = multiprocessing.Pipe()
             process = multiprocessing.Process(
                 target=evaluate_in_subprocess, args=(self, child_conn, solution)
             )
             process.start()
-            process.join(
-                timeout=self.eval_timeout + 60
-            )  # We allow 1 minute for setting up the environment.
+            process.join(timeout=self.eval_timeout + 60)
 
             if process.is_alive():
                 raise TimeoutException(
@@ -274,48 +395,11 @@ class Problem(ABC):
                 )
             if parent_conn.poll():
                 result = parent_conn.recv()
-                if isinstance(result, dict):
-                    stdout = result.get("stdout", "")
-                    stderr = result.get("stderr", "")
-                    if "error" in result:
-                        err = result["error"]
-                        solution.set_scores(
-                            -np.inf,
-                            feedback=err,
-                            error=err,
-                        )
-                    else:
-                        data = result.get("result")
-                        if isinstance(data, Solution):
-                            solution = data
-                        elif isinstance(data, str):
-                            solution.set_scores(
-                                -np.inf,
-                                feedback=data,
-                                error=data,
-                            )
-                        else:
-                            raise Exception("No Solution object or string returned.")
-                elif isinstance(result, Exception):
-                    raise result
-                elif isinstance(result, Solution):
-                    solution = result
-                elif isinstance(result, str):
-                    solution.set_scores(
-                        -np.inf,
-                        feedback=result,
-                        error=result,
-                    )
-                else:
-                    raise Exception("No Solution object or string returned.")
+                solution, stdout, stderr = self._handle_result(result, solution)
             else:
                 raise Exception("Evaluation failed without an exception.")
         except Exception as e:
-            solution.set_scores(
-                -np.inf,
-                feedback=f"{e}",
-                error=f"{e}",
-            )
+            solution.set_scores(-np.inf, feedback=f"{e}")
         finally:
             if process is not None:
                 if process.is_alive():
@@ -328,9 +412,124 @@ class Problem(ABC):
 
         self._last_stdout = stdout
         self._last_stderr = stderr
-        if self.logger is not None:
-            self.logger.log_individual(solution)
         return solution
+
+    def _call_worker_pool(self, solution):
+        """Persistent worker process implementation."""
+        self._last_stdout = ""
+        self._last_stderr = ""
+        try:
+            self._ensure_env()
+            # Start or recycle worker
+            if self._worker_process is None or self._worker_process.poll() is not None:
+                self._start_worker()
+            elif (self.worker_recycle_interval > 0
+                  and self._eval_count % self.worker_recycle_interval == 0
+                  and self._eval_count > 0):
+                logger.debug("Recycling worker after %d evaluations", self._eval_count)
+                self._restart_worker()
+
+            result = self._send_recv_worker(solution)
+            self._eval_count += 1
+            solution, stdout, stderr = self._handle_result(result, solution)
+            self._last_stdout = stdout
+            self._last_stderr = stderr
+        except Exception as e:
+            logger.warning("Worker pool error: %s — restarting worker", e)
+            self._stop_worker()
+            solution.set_scores(-np.inf, feedback=f"{e}")
+        return solution
+
+    # --- Worker lifecycle ---
+
+    def _start_worker(self):
+        """Spawn a persistent worker subprocess."""
+        env_path = self._env_path
+        python_bin = self._python_bin
+
+        # Write worker script
+        script_path = env_path / "worker_loop.py"
+        script_path.write_text(_WORKER_LOOP_SCRIPT)
+
+        # Pickle problem (without logger/worker refs)
+        problem_pickle = env_path / "problem.pkl"
+        problem_copy = copy.deepcopy(self)
+        problem_copy.logger = None
+        problem_copy._worker_process = None
+        with open(problem_pickle, "wb") as f:
+            cloudpickle.dump(problem_copy, f)
+
+        # Build PYTHONPATH
+        repo_root = Path(__file__).resolve().parents[1]
+        path_parts = [str(repo_root)]
+        for p in self.extra_pythonpath:
+            if str(p) not in path_parts:
+                path_parts.insert(0, str(p))
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(path_parts) + os.pathsep + env.get("PYTHONPATH", "")
+
+        self._worker_process = subprocess.Popen(
+            [str(python_bin), str(script_path), str(problem_pickle)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        logger.debug("Started worker process PID %d", self._worker_process.pid)
+
+    def _stop_worker(self):
+        """Gracefully shut down the worker process."""
+        proc = self._worker_process
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                # Send zero-length shutdown message
+                proc.stdin.write(struct.pack('>I', 0))
+                proc.stdin.flush()
+                proc.wait(timeout=5)
+        except Exception:
+            pass
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            self._worker_process = None
+
+    def _restart_worker(self):
+        """Stop and restart the worker process."""
+        self._stop_worker()
+        # Delete stale problem pickle so it gets re-created
+        problem_pickle = self._env_path / "problem.pkl"
+        if problem_pickle.exists():
+            problem_pickle.unlink()
+        self._start_worker()
+
+    def _send_recv_worker(self, solution):
+        """Send a solution to the worker and receive the result."""
+        proc = self._worker_process
+        data = cloudpickle.dumps(solution)
+        # Send length-prefixed message
+        proc.stdin.write(struct.pack('>I', len(data)))
+        proc.stdin.write(data)
+        proc.stdin.flush()
+
+        # Wait for response with timeout
+        if hasattr(select, 'select'):
+            ready, _, _ = select.select([proc.stdout], [], [], self.eval_timeout + 60)
+            if not ready:
+                self._stop_worker()
+                raise TimeoutException(
+                    f"Worker evaluation timed out after {self.eval_timeout} seconds."
+                )
+
+        # Read length-prefixed response
+        header = proc.stdout.read(4)
+        if not header or len(header) < 4:
+            raise Exception("Worker process closed unexpectedly.")
+        resp_len = struct.unpack('>I', header)[0]
+        resp_data = proc.stdout.read(resp_len)
+        return cloudpickle.loads(resp_data)
 
     def _ensure_env(self):
         """Create the virtual environment for evaluations if it does not exist."""
@@ -355,9 +554,26 @@ class Problem(ABC):
             )
 
     def cleanup(self):
+        self._stop_worker()
         try:
             if self._env_path and self._env_path.exists():
                 shutil.rmtree(self._env_path)
+        except Exception:
+            pass
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_worker_process'] = None
+        state['logger'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._worker_process = None
+
+    def __del__(self):
+        try:
+            self._stop_worker()
         except Exception:
             pass
 
