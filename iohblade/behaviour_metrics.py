@@ -395,7 +395,7 @@ def fitness_hurst_exponent(df: pd.DataFrame) -> float:
     H>0.5 = persistent, H<0.5 = anti-persistent, H=0.5 = random."""
     try:
         import nolds
-    except ImportError:
+    except Exception:
         return float("nan")
     y = get_objective(df)
     if len(y) < 100:
@@ -411,7 +411,7 @@ def fitness_dfa_alpha(df: pd.DataFrame) -> float:
     series. alpha~0.5=noise, ~1.0=1/f, ~1.5=Brownian/smooth convergence."""
     try:
         import nolds
-    except ImportError:
+    except Exception:
         return float("nan")
     y = get_objective(df)
     if len(y) < 100:
