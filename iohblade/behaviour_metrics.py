@@ -281,6 +281,305 @@ def last_improvement_fraction(df: pd.DataFrame) -> float:
 
 
 # ---------------------------------------------------------------------
+# Category 1: Step-Size & Movement Dynamics
+# ---------------------------------------------------------------------
+
+
+def _consecutive_step_sizes(df: pd.DataFrame) -> np.ndarray:
+    """Euclidean distances between consecutive evaluations."""
+    X = get_coordinates(df)
+    if len(X) < 2:
+        return np.array([0.0])
+    return np.linalg.norm(np.diff(X, axis=0), axis=1)
+
+
+def step_size_mean(df: pd.DataFrame) -> float:
+    """Mean Euclidean distance between consecutive evaluations."""
+    return float(np.mean(_consecutive_step_sizes(df)))
+
+
+def step_size_std(df: pd.DataFrame) -> float:
+    """Standard deviation of consecutive step sizes."""
+    return float(np.std(_consecutive_step_sizes(df)))
+
+
+def step_size_trend(df: pd.DataFrame) -> float:
+    """Slope of linear regression of step sizes over evaluation index.
+    Negative = contracting (convergence), positive = expanding."""
+    steps = _consecutive_step_sizes(df)
+    if len(steps) < 2:
+        return 0.0
+    t = np.arange(len(steps)).reshape(-1, 1)
+    reg = LinearRegression().fit(t, steps)
+    return float(reg.coef_[0])
+
+
+def directional_persistence(df: pd.DataFrame) -> float:
+    """Mean cosine similarity between consecutive displacement vectors.
+    High (~1) = persistent direction, low (~0) = random/zigzag."""
+    X = get_coordinates(df)
+    if len(X) < 3:
+        return 0.0
+    displacements = np.diff(X, axis=0)
+    norms = np.linalg.norm(displacements, axis=1, keepdims=True)
+    norms = np.maximum(norms, np.finfo(float).eps)
+    unit_d = displacements / norms
+    cos_sim = np.sum(unit_d[:-1] * unit_d[1:], axis=1)
+    return float(np.mean(cos_sim))
+
+
+# ---------------------------------------------------------------------
+# Category 2: Information-Theoretic Features
+# ---------------------------------------------------------------------
+
+
+def fitness_sample_entropy(df: pd.DataFrame, m: int = 2,
+                           subsample_step: int = 10) -> float:
+    """Sample entropy of raw_y (Richman & Moorman 2000).
+    Subsampled for performance (O(n^2) on full series)."""
+    try:
+        import antropy
+    except ImportError:
+        return float("nan")
+    y = get_objective(df)
+    y_sub = np.ascontiguousarray(y[::subsample_step])
+    if len(y_sub) < 50:
+        return float("nan")
+    if np.std(y_sub) == 0:
+        return 0.0
+    return float(antropy.sample_entropy(y_sub, order=int(m), metric="chebyshev"))
+
+
+def fitness_permutation_entropy(df: pd.DataFrame, order: int = 5,
+                                delay: int = 1) -> float:
+    """Normalized permutation entropy of raw_y (Bandt & Pompe 2002)."""
+    try:
+        import antropy
+    except ImportError:
+        return float("nan")
+    y = get_objective(df)
+    if len(y) < 2 * math.factorial(order):
+        return float("nan")
+    return float(antropy.perm_entropy(y, order=order, delay=delay,
+                                      normalize=True))
+
+
+def fitness_autocorrelation_lag1(df: pd.DataFrame) -> float:
+    """Lag-1 autocorrelation of raw_y (Weinberger 1990)."""
+    y = get_objective(df)
+    if len(y) < 3:
+        return 0.0
+    y_c = y - np.mean(y)
+    var = np.dot(y_c, y_c)
+    if var == 0:
+        return 0.0
+    return float(np.dot(y_c[:-1], y_c[1:]) / var)
+
+
+def fitness_lempel_ziv_complexity(df: pd.DataFrame) -> float:
+    """Normalized Lempel-Ziv complexity of binarized fitness changes
+    (Lempel & Ziv 1976). Binary: 1 if f improves, 0 otherwise."""
+    try:
+        import antropy
+    except ImportError:
+        return float("nan")
+    y = get_objective(df)
+    if len(y) < 3:
+        return 0.0
+    binary = (np.diff(y) < 0).astype(int)
+    return float(antropy.lziv_complexity(binary, normalize=True))
+
+
+def fitness_hurst_exponent(df: pd.DataFrame) -> float:
+    """Hurst exponent via rescaled range analysis (Hurst 1951).
+    H>0.5 = persistent, H<0.5 = anti-persistent, H=0.5 = random."""
+    try:
+        import nolds
+    except ImportError:
+        return float("nan")
+    y = get_objective(df)
+    if len(y) < 100:
+        return float("nan")
+    try:
+        return float(nolds.hurst_rs(y, corrected=True))
+    except Exception:
+        return float("nan")
+
+
+def fitness_dfa_alpha(df: pd.DataFrame) -> float:
+    """DFA scaling exponent (Peng et al. 1994). Handles non-stationary
+    series. alpha~0.5=noise, ~1.0=1/f, ~1.5=Brownian/smooth convergence."""
+    try:
+        import nolds
+    except ImportError:
+        return float("nan")
+    y = get_objective(df)
+    if len(y) < 100:
+        return float("nan")
+    try:
+        return float(nolds.dfa(y, order=1))
+    except Exception:
+        return float("nan")
+
+
+# ---------------------------------------------------------------------
+# Category 4: Adapted DynamoRep -- Early/Late Dynamics
+# (Inspired by Cenikj et al. 2023, adapted for (1+1)-ES)
+# ---------------------------------------------------------------------
+
+
+def x_spread_early(df: pd.DataFrame) -> float:
+    """Mean per-dimension std of x-coordinates in first 25% of evaluations."""
+    X = get_coordinates(df)
+    cutoff = max(1, len(X) // 4)
+    return float(np.mean(np.std(X[:cutoff], axis=0)))
+
+
+def x_spread_late(df: pd.DataFrame) -> float:
+    """Mean per-dimension std of x-coordinates in last 25% of evaluations."""
+    X = get_coordinates(df)
+    cutoff = max(1, len(X) // 4)
+    return float(np.mean(np.std(X[-cutoff:], axis=0)))
+
+
+def spread_ratio(df: pd.DataFrame) -> float:
+    """Ratio of late to early x-spread. <1 = convergence, >1 = divergence."""
+    early = x_spread_early(df)
+    if early == 0:
+        return 0.0
+    return float(x_spread_late(df) / early)
+
+
+def centroid_drift(df: pd.DataFrame) -> float:
+    """Euclidean distance between centroid of first 25% and last 25%."""
+    X = get_coordinates(df)
+    cutoff = max(1, len(X) // 4)
+    c_early = np.mean(X[:cutoff], axis=0)
+    c_late = np.mean(X[-cutoff:], axis=0)
+    return float(np.linalg.norm(c_late - c_early))
+
+
+def f_range_early(df: pd.DataFrame) -> float:
+    """Range (max-min) of fitness in first 25% of evaluations."""
+    y = get_objective(df)
+    cutoff = max(1, len(y) // 4)
+    return float(np.ptp(y[:cutoff]))
+
+
+def f_range_late(df: pd.DataFrame) -> float:
+    """Range (max-min) of fitness in last 25% of evaluations."""
+    y = get_objective(df)
+    cutoff = max(1, len(y) // 4)
+    return float(np.ptp(y[-cutoff:]))
+
+
+def f_range_ratio(df: pd.DataFrame) -> float:
+    """Ratio of late to early fitness range. <1 = narrowing, >1 = widening."""
+    early = f_range_early(df)
+    if early == 0:
+        return 0.0
+    return float(f_range_late(df) / early)
+
+
+# ---------------------------------------------------------------------
+# Category 5: Novel Features
+# ---------------------------------------------------------------------
+
+
+def improvement_spatial_correlation(df: pd.DataFrame) -> float:
+    """Pearson correlation between step size and improvement magnitude,
+    on improving steps only. Positive = big jumps yield big improvements."""
+    X = get_coordinates(df)
+    y = get_objective(df)
+    if len(y) < 3:
+        return 0.0
+    best_so_far = np.minimum.accumulate(y)
+    improving = np.zeros(len(y), dtype=bool)
+    improving[1:] = y[1:] < best_so_far[:-1]
+    idx = np.where(improving)[0]
+    if len(idx) < 3:
+        return 0.0
+    steps = np.linalg.norm(X[idx] - X[idx - 1], axis=1)
+    imps = best_so_far[idx - 1] - y[idx]
+    if np.std(steps) == 0 or np.std(imps) == 0:
+        return 0.0
+    return float(np.corrcoef(steps, imps)[0, 1])
+
+
+def improvement_burstiness(df: pd.DataFrame) -> float:
+    """CV of inter-improvement intervals. High = bursty improvements,
+    low = steady improvement rate. Inspired by Barabasi (2005)."""
+    y = get_objective(df)
+    best = y[0]
+    imp_idx = []
+    for t in range(1, len(y)):
+        if y[t] < best:
+            imp_idx.append(t)
+            best = y[t]
+    if len(imp_idx) < 3:
+        return 0.0
+    intervals = np.diff(imp_idx).astype(float)
+    mu = np.mean(intervals)
+    if mu == 0:
+        return 0.0
+    return float(np.std(intervals) / mu)
+
+
+def dimension_convergence_heterogeneity(df: pd.DataFrame) -> float:
+    """Std across dimensions of per-dimension range shrinkage (late/early).
+    High = uneven convergence across dimensions."""
+    X = get_coordinates(df)
+    n, d = X.shape
+    if n < 4 or d < 2:
+        return 0.0
+    cutoff = max(1, n // 4)
+    shrinkages = []
+    for j in range(d):
+        r_early = np.ptp(X[:cutoff, j])
+        r_late = np.ptp(X[-cutoff:, j])
+        shrinkages.append(r_late / r_early if r_early > 0 else 0.0)
+    return float(np.std(shrinkages))
+
+
+def step_size_autocorrelation(df: pd.DataFrame) -> float:
+    """Lag-1 autocorrelation of step sizes (not fitness).
+    Captures search momentum."""
+    steps = _consecutive_step_sizes(df)
+    if len(steps) < 3:
+        return 0.0
+    s_c = steps - np.mean(steps)
+    var = np.dot(s_c, s_c)
+    if var == 0:
+        return 0.0
+    return float(np.dot(s_c[:-1], s_c[1:]) / var)
+
+
+def fitness_plateau_fraction(df: pd.DataFrame) -> float:
+    """Fraction of consecutive evaluations with negligible fitness change.
+    Uses raw fitness (not best-so-far), capturing flat landscape regions."""
+    y = get_objective(df)
+    if len(y) < 2:
+        return 0.0
+    y_range = np.ptp(y)
+    if y_range == 0:
+        return 1.0
+    eps = 1e-8 * y_range
+    return float(np.mean(np.abs(np.diff(y)) < eps))
+
+
+def half_convergence_time(df: pd.DataFrame) -> float:
+    """Fraction of budget when best-so-far reaches 50% of total improvement.
+    Low = fast early convergence, high = slow or late convergence."""
+    y = get_objective(df)
+    bsf = np.minimum.accumulate(y)
+    total_imp = bsf[0] - bsf[-1]
+    if total_imp <= 0:
+        return 1.0
+    half_target = bsf[0] - 0.5 * total_imp
+    idx = np.searchsorted(-bsf, -half_target)
+    return float(idx / max(1, len(y) - 1))
+
+
 # ---------------------------------------------------------------------
 # Unified summary function
 # ---------------------------------------------------------------------
@@ -325,5 +624,32 @@ def compute_behavior_metrics(
         # Stagnation
         "longest_no_improvement_streak": longest_no_improvement_streak(df),
         "last_improvement_fraction": last_improvement_fraction(df),
+        # Cat 1: Step-size dynamics
+        "step_size_mean": step_size_mean(df),
+        "step_size_std": step_size_std(df),
+        "step_size_trend": step_size_trend(df),
+        "directional_persistence": directional_persistence(df),
+        # Cat 2: Information-theoretic
+        "fitness_sample_entropy": fitness_sample_entropy(df),
+        "fitness_permutation_entropy": fitness_permutation_entropy(df),
+        "fitness_autocorrelation_lag1": fitness_autocorrelation_lag1(df),
+        "fitness_lempel_ziv_complexity": fitness_lempel_ziv_complexity(df),
+        "fitness_hurst_exponent": fitness_hurst_exponent(df),
+        "fitness_dfa_alpha": fitness_dfa_alpha(df),
+        # Cat 4: Adapted DynamoRep (early/late dynamics)
+        "x_spread_early": x_spread_early(df),
+        "x_spread_late": x_spread_late(df),
+        "spread_ratio": spread_ratio(df),
+        "centroid_drift": centroid_drift(df),
+        "f_range_early": f_range_early(df),
+        "f_range_late": f_range_late(df),
+        "f_range_ratio": f_range_ratio(df),
+        # Cat 5: Novel features
+        "improvement_spatial_correlation": improvement_spatial_correlation(df),
+        "improvement_burstiness": improvement_burstiness(df),
+        "dimension_convergence_heterogeneity": dimension_convergence_heterogeneity(df),
+        "step_size_autocorrelation": step_size_autocorrelation(df),
+        "fitness_plateau_fraction": fitness_plateau_fraction(df),
+        "half_convergence_time": half_convergence_time(df),
     }
     return metrics
