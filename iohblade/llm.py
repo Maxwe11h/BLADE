@@ -208,7 +208,10 @@ class LLM(ABC):
             NoCodeException: If the language model fails to return any code.
             Exception: Captures and logs any other exceptions that occur during the interaction.
         """
+        import time as _time
+        _t0 = _time.monotonic()
         message = self.query(session_messages, **kwargs)
+        _llm_time = _time.monotonic() - _t0
 
         code = self.extract_algorithm_code(message)
         name = self.extract_classname(code)
@@ -223,6 +226,7 @@ class LLM(ABC):
             code=code,
             parent_ids=parent_ids,
         )
+        new_individual.add_metadata("llm_generation_time_s", round(_llm_time, 3))
 
         return new_individual
 
@@ -635,6 +639,50 @@ class Ollama_LLM(LLM):
             except ollama.ResponseError as err:
                 attempt += 1
                 if attempt > max_retries or err.status_code not in (429, 500, 503):
+                    raise
+                time.sleep(default_delay * attempt)
+
+
+class VLLM_LLM(LLM):
+    """LLM backend using vLLM's OpenAI-compatible API for batch inference."""
+
+    def __init__(self, model, base_url="http://localhost:8000/v1", **kwargs):
+        if openai is None:
+            raise ImportError("openai package is required for VLLM_LLM: pip install openai")
+        self.base_url = base_url
+        self.client = openai.OpenAI(base_url=base_url, api_key="unused")
+        super().__init__("", model, None, **kwargs)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("client", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.client = openai.OpenAI(base_url=self.base_url, api_key="unused")
+
+    def _query(self, session_messages, max_retries=5, default_delay=10, **kwargs):
+        # Concatenate messages (same behavior as Ollama_LLM)
+        big_message = ""
+        for msg in session_messages:
+            big_message += msg["content"] + "\n"
+
+        attempt = 0
+        while True:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": big_message}],
+                )
+                content = response.choices[0].message.content
+                # Strip thinking tags (Qwen3 etc.)
+                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                return content
+            except Exception as err:
+                attempt += 1
+                status = getattr(err, "status_code", getattr(err, "code", None))
+                if attempt > max_retries or status not in (429, 500, 503, None):
                     raise
                 time.sleep(default_delay * attempt)
 
