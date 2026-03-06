@@ -649,9 +649,9 @@ class VLLM_LLM(LLM):
     def __init__(self, model, base_url="http://localhost:8000/v1", **kwargs):
         if openai is None:
             raise ImportError("openai package is required for VLLM_LLM: pip install openai")
-        self.base_url = base_url
+        super().__init__("", model, base_url, **kwargs)
+        self.base_url = base_url  # ensure not overwritten
         self.client = openai.OpenAI(base_url=base_url, api_key="unused")
-        super().__init__("", model, None, **kwargs)
 
     def __getstate__(self):
         state = self.__dict__.copy()
