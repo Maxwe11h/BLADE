@@ -25,6 +25,7 @@ BASE_DEPENDENCIES = [
     "joblib>=1.4.2,<2",
 ]
 
+import atexit
 import copy
 import re
 
@@ -250,6 +251,12 @@ class Problem(ABC):
     Abstract problem class.
     """
 
+    # Class-level shared virtualenv so all instances (and deep copies) reuse
+    # the same environment instead of each creating their own.
+    _shared_env_path: Path | None = None
+    _shared_python_bin: Path | None = None
+    _shared_env_deps: list | None = None  # deps that were installed
+
     def __init__(
         self,
         logger=None,
@@ -297,7 +304,7 @@ class Problem(ABC):
         else:
             self.imports = imports
 
-        # Path to the virtual environment used for evaluations
+        # Per-instance references (populated from class-level shared env)
         self._env_path: Path | None = None
         self._python_bin: Path | None = None
 
@@ -532,39 +539,80 @@ class Problem(ABC):
         return cloudpickle.loads(resp_data)
 
     def _ensure_env(self):
-        """Create the virtual environment for evaluations if it does not exist."""
-        if self._env_path is not None:
+        """Create or reuse the shared virtual environment for evaluations.
+
+        All Problem instances share a single virtualenv at the class level.
+        If the required dependencies change, the env is rebuilt.
+        """
+        deps = sorted(getattr(self, "dependencies", []))
+
+        # Already have a per-instance reference that's still valid
+        if self._env_path is not None and self._env_path.exists():
             return
+
+        # Reuse existing shared env if deps match
+        cls = type(self)
+        if (cls._shared_env_path is not None
+                and cls._shared_env_path.exists()
+                and cls._shared_env_deps == deps):
+            self._env_path = cls._shared_env_path
+            self._python_bin = cls._shared_python_bin
+            return
+
+        # Create the shared env
         import virtualenv
 
         env_dir = tempfile.mkdtemp(prefix="blade_env_")
-        self._env_path = Path(env_dir)
+        env_path = Path(env_dir)
         virtualenv.cli_run([env_dir])
-        self._python_bin = (
-            self._env_path / ("Scripts" if os.name == "nt" else "bin") / "python"
+        python_bin = (
+            env_path / ("Scripts" if os.name == "nt" else "bin") / "python"
         )
 
-        deps = getattr(self, "dependencies", [])
         if deps:
             subprocess.run(
-                [str(self._python_bin), "-m", "pip", "install", *deps],
+                [str(python_bin), "-m", "pip", "install", *deps],
                 check=True,
                 capture_output=True,
                 text=True,
             )
 
-    def cleanup(self):
-        self._stop_worker()
+        # Store at class level
+        cls._shared_env_path = env_path
+        cls._shared_python_bin = python_bin
+        cls._shared_env_deps = deps
+
+        # Register cleanup on interpreter exit
+        atexit.register(cls._cleanup_shared_env)
+
+        # Set per-instance references
+        self._env_path = env_path
+        self._python_bin = python_bin
+        logger.debug("Created shared blade env at %s", env_dir)
+
+    @classmethod
+    def _cleanup_shared_env(cls):
+        """Remove the shared virtualenv (called via atexit)."""
         try:
-            if self._env_path and self._env_path.exists():
-                shutil.rmtree(self._env_path)
+            if cls._shared_env_path and cls._shared_env_path.exists():
+                shutil.rmtree(cls._shared_env_path)
+                logger.debug("Cleaned up shared blade env at %s", cls._shared_env_path)
         except Exception:
             pass
+        cls._shared_env_path = None
+        cls._shared_python_bin = None
+        cls._shared_env_deps = None
+
+    def cleanup(self):
+        self._stop_worker()
+        self._env_path = None
+        self._python_bin = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state['_worker_process'] = None
         state['logger'] = None
+        # Preserve _env_path so deep copies reuse the shared env
         return state
 
     def __setstate__(self, state):
