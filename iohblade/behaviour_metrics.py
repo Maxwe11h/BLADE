@@ -27,7 +27,6 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import ConvexHull, distance_matrix
 from scipy.spatial.distance import pdist, squareform
-from scipy.stats import gaussian_kde
 from sklearn.linear_model import LinearRegression
 from sklearn.neighbors import NearestNeighbors
 
@@ -105,16 +104,6 @@ def coverage_dispersion(
 
     return float(distances.max())
 
-
-def spatial_entropy(df: pd.DataFrame, bandwidth: str | float = "scott") -> float:
-    """
-    Differential entropy estimate of the empirical sample distribution.
-    Uses Gaussian KDE from scipy. High entropy -> diverse sampling.
-    """
-    X = get_coordinates(df).T  # gaussian_kde expects shape (d, N)
-    kde = gaussian_kde(X, bw_method=bandwidth)
-    log_probs = kde.logpdf(X)
-    return float(-log_probs.mean())
 
 
 # ---------------------------------------------------------------------
@@ -364,7 +353,7 @@ def fitness_permutation_entropy(df: pd.DataFrame, order: int = 5,
                                       normalize=True))
 
 
-def fitness_autocorrelation_lag1(df: pd.DataFrame) -> float:
+def fitness_autocorrelation(df: pd.DataFrame) -> float:
     """Lag-1 autocorrelation of raw_y (Weinberger 1990)."""
     y = get_objective(df)
     if len(y) < 3:
@@ -389,37 +378,6 @@ def fitness_lempel_ziv_complexity(df: pd.DataFrame) -> float:
     binary = (np.diff(y) < 0).astype(int)
     return float(antropy.lziv_complexity(binary, normalize=True))
 
-
-def fitness_hurst_exponent(df: pd.DataFrame) -> float:
-    """Hurst exponent via rescaled range analysis (Hurst 1951).
-    H>0.5 = persistent, H<0.5 = anti-persistent, H=0.5 = random."""
-    try:
-        import nolds
-    except Exception:
-        return float("nan")
-    y = get_objective(df)
-    if len(y) < 100:
-        return float("nan")
-    try:
-        return float(nolds.hurst_rs(y, corrected=True))
-    except Exception:
-        return float("nan")
-
-
-def fitness_dfa_alpha(df: pd.DataFrame) -> float:
-    """DFA scaling exponent (Peng et al. 1994). Handles non-stationary
-    series. alpha~0.5=noise, ~1.0=1/f, ~1.5=Brownian/smooth convergence."""
-    try:
-        import nolds
-    except Exception:
-        return float("nan")
-    y = get_objective(df)
-    if len(y) < 100:
-        return float("nan")
-    try:
-        return float(nolds.dfa(y, order=1))
-    except Exception:
-        return float("nan")
 
 
 # ---------------------------------------------------------------------
@@ -611,7 +569,6 @@ def compute_behavior_metrics(
         # Exploration & diversity
         "avg_nearest_neighbor_distance": average_nearest_neighbor_distance(df),
         "dispersion": coverage_dispersion(df, bounds, disp_samples),
-        # "spatial_entropy": spatial_entropy(df),
         "avg_exploration_pct": avg_exploration_pct,
         # Exploitation
         "avg_distance_to_best": average_distance_to_best_so_far(df),
@@ -632,10 +589,8 @@ def compute_behavior_metrics(
         # Cat 2: Information-theoretic
         "fitness_sample_entropy": fitness_sample_entropy(df),
         "fitness_permutation_entropy": fitness_permutation_entropy(df),
-        "fitness_autocorrelation_lag1": fitness_autocorrelation_lag1(df),
+        "fitness_autocorrelation": fitness_autocorrelation(df),
         "fitness_lempel_ziv_complexity": fitness_lempel_ziv_complexity(df),
-        "fitness_hurst_exponent": fitness_hurst_exponent(df),
-        "fitness_dfa_alpha": fitness_dfa_alpha(df),
         # Cat 4: Adapted DynamoRep (early/late dynamics)
         "x_spread_early": x_spread_early(df),
         "x_spread_late": x_spread_late(df),
