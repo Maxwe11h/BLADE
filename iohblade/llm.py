@@ -478,18 +478,28 @@ class DeepSeek_LLM(OpenAI_LLM):
 class Gemini_LLM(LLM):
     """
     A manager class for handling requests to Google's Gemini models.
+
+    Supports two backends:
+      - API key mode (default): ``Gemini_LLM(api_key=..., model=...)``
+      - Vertex AI mode: ``Gemini_LLM(api_key="", model=..., vertexai=True,
+        project=..., location=...)``  Uses application-default credentials
+        and routes through ``aiplatform.googleapis.com`` (covered by GCP
+        free-trial credits).
     """
 
     def __init__(
-        self, api_key, model="gemini-2.0-flash", generation_config=None, **kwargs
+        self, api_key, model="gemini-2.0-flash", generation_config=None,
+        vertexai=False, project=None, location="global", **kwargs
     ):
         """
         Initializes the LLM manager with an API key and model name.
 
         Args:
-            api_key (str): api key for authentication.
+            api_key (str): api key for authentication (ignored when vertexai=True).
             model (str, optional): model abbreviation. Defaults to "gemini-2.0-flash".
-                Options are: "gemini-1.5-flash","gemini-2.0-flash", and others from Googles models library.
+            vertexai (bool): If True, use Vertex AI backend with ADC instead of API key.
+            project (str): GCP project ID (required when vertexai=True).
+            location (str): GCP region (default "global").
         """
         super().__init__(api_key, model, None, **kwargs)
         if generation_config is None:
@@ -501,8 +511,17 @@ class Gemini_LLM(LLM):
                 "response_mime_type": "text/plain",
             }
 
-        self.client = genai.Client(api_key=api_key)
+        self.vertexai = vertexai
+        self.project = project
+        self.location = location
         self.api_key = api_key
+
+        if vertexai:
+            self.client = genai.Client(
+                vertexai=True, project=project, location=location,
+            )
+        else:
+            self.client = genai.Client(api_key=api_key)
         self.generation_config = generation_config
 
     def _query(
@@ -561,7 +580,12 @@ class Gemini_LLM(LLM):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self.client = genai.Client(api_key=self.api_key)
+        if getattr(self, 'vertexai', False):
+            self.client = genai.Client(
+                vertexai=True, project=self.project, location=self.location,
+            )
+        else:
+            self.client = genai.Client(api_key=self.api_key)
 
     def __deepcopy__(self, memo):
         cls = self.__class__
@@ -571,7 +595,12 @@ class Gemini_LLM(LLM):
             if k == "client":
                 continue
             setattr(new, k, copy.deepcopy(v, memo))
-        new.client = genai.Client(api_key=new.api_key)
+        if getattr(new, 'vertexai', False):
+            new.client = genai.Client(
+                vertexai=True, project=new.project, location=new.location,
+            )
+        else:
+            new.client = genai.Client(api_key=new.api_key)
         return new
 
 
